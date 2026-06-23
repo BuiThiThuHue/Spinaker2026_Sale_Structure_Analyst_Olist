@@ -1,0 +1,700 @@
+---
+title: "Olist Sales Structure"
+author: "Group 2"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    theme: flatly
+    number_sections: false
+  word_document:
+    toc: true
+    toc_depth: '2'
+  pdf_document:
+    toc: true
+    toc_depth: 2
+subtitle: What is selling, what is not, and what should Sales do next?
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 9,
+  fig.height = 5.6
+)
+
+library(tidyverse)
+library(scales)
+library(knitr)
+
+theme_exec <- function(base_size = 12) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title = element_text(face = "bold", size = base_size + 3),
+      plot.subtitle = element_text(color = "gray35"),
+      panel.grid.minor = element_blank(),
+      axis.title.y = element_blank(),
+      legend.position = "bottom",
+      plot.margin = margin(10, 35, 10, 10)
+    )
+}
+
+get_project_dir <- function() {
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    active_file <- rstudioapi::getActiveDocumentContext()$path
+    if (!is.null(active_file) && nzchar(active_file)) {
+      return(dirname(active_file))
+    }
+  }
+
+  getwd()
+}
+```
+
+```{r data-prep, include=FALSE}
+project_dir <- get_project_dir()
+data_dir <- file.path(project_dir, "olist dataset")
+
+if (!dir.exists(data_dir)) {
+  stop(
+    "Data folder not found: ", data_dir, "\n",
+    "Please open this Rmd file from the project folder in RStudio, ",
+    "or set project_dir manually to the folder that contains 'olist dataset'."
+  )
+}
+
+orders <- read_csv(file.path(data_dir, "olist_orders_dataset.csv"))
+order_items <- read_csv(file.path(data_dir, "olist_order_items_dataset.csv"))
+products <- read_csv(file.path(data_dir, "olist_products_dataset.csv"))
+category_translation <- read_csv(file.path(data_dir, "product_category_name_translation.csv"))
+
+sales_items <- order_items %>%
+  left_join(
+    products %>% select(product_id, product_category_name),
+    by = "product_id"
+  ) %>%
+  left_join(category_translation, by = "product_category_name") %>%
+  left_join(
+    orders %>% select(order_id, customer_id, order_status),
+    by = "order_id"
+  ) %>%
+  mutate(
+    category = coalesce(product_category_name_english, product_category_name, "unknown"),
+    category_label = str_to_title(str_replace_all(category, "_", " "))
+  ) %>%
+  filter(order_status == "delivered")
+
+category_perf <- sales_items %>%
+  group_by(category, category_label) %>%
+  summarise(
+    units_sold = n(),
+    orders = n_distinct(order_id),
+    customers = n_distinct(customer_id),
+    revenue = sum(price, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE),
+    revenue_per_order = revenue / orders,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    unit_share = units_sold / sum(units_sold),
+    order_share = orders / sum(orders),
+    revenue_share = revenue / sum(revenue)
+  )
+
+product_perf <- sales_items %>%
+  group_by(product_id, category_label) %>%
+  summarise(
+    units_sold = n(),
+    orders = n_distinct(order_id),
+    revenue = sum(price, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(units_sold), desc(revenue)) %>%
+  mutate(
+    product_rank = row_number(),
+    product_label = paste0(category_label, " (", str_sub(product_id, 1, 8), ")"),
+    unit_share = units_sold / sum(units_sold),
+    cumulative_unit_share = cumsum(unit_share)
+  )
+
+bottom_categories <- category_perf %>%
+  arrange(revenue, orders) %>%
+  slice_head(n = 10)
+
+no_delivered_sales_products <- products %>%
+  anti_join(sales_items %>% distinct(product_id), by = "product_id") %>%
+  left_join(category_translation, by = "product_category_name") %>%
+  mutate(category_label = str_to_title(str_replace_all(
+    coalesce(product_category_name_english, product_category_name, "unknown"),
+    "_",
+    " "
+  )))
+
+median_orders <- median(category_perf$orders)
+median_value_per_order <- median(category_perf$revenue_per_order)
+
+category_strategy <- category_perf %>%
+  mutate(
+    volume_bucket = if_else(orders >= median_orders, "High Volume", "Low Volume"),
+    value_bucket = if_else(revenue_per_order >= median_value_per_order, "High Value", "Low Value"),
+    strategic_bucket = case_when(
+      orders >= median_orders & revenue_per_order < median_value_per_order ~ "High Volume - Low Value",
+      orders < median_orders & revenue_per_order >= median_value_per_order ~ "Low Volume - High Value",
+      orders >= median_orders & revenue_per_order >= median_value_per_order ~ "High Volume - High Value",
+      TRUE ~ "Low Volume - Low Value"
+    )
+  )
+
+top_category_units <- category_perf %>% arrange(desc(units_sold)) %>% slice_head(n = 1)
+top_category_revenue <- category_perf %>% arrange(desc(revenue)) %>% slice_head(n = 1)
+top_5_unit_share <- category_perf %>% slice_max(units_sold, n = 5) %>% summarise(x = sum(unit_share)) %>% pull(x)
+tail_revenue_share <- bottom_categories %>% summarise(x = sum(revenue_share)) %>% pull(x)
+one_unit_product_share <- product_perf %>% summarise(x = mean(units_sold == 1)) %>% pull(x)
+products_for_80pct <- product_perf %>%
+  summarise(x = min(product_rank[cumulative_unit_share >= 0.80])) %>%
+  pull(x)
+```
+
+
+## Business Question
+
+This report answers two sales questions:
+
+- **What is selling?** Categories and products with the strongest delivered order volume and revenue.
+- **What is not finding customers?** Categories and products with very low delivered sales or no completed delivered sales.
+
+The analysis uses only **delivered orders** to focus on completed purchases. Product-level charts use category names plus short product IDs because the Olist dataset does not include human-readable product names.
+
+## Sales Structure: What Is Selling?
+
+### Top Categories By Order Quantity
+
+```{r top-categories-volume}
+category_perf %>%
+  slice_max(units_sold, n = 12) %>%
+  mutate(category_label = fct_reorder(category_label, units_sold)) %>%
+  ggplot(aes(x = units_sold, y = category_label)) +
+  geom_col(fill = "#276b62", width = 0.72) +
+  geom_text(aes(label = comma(units_sold)), hjust = -0.12, size = 3.2) +
+  scale_x_continuous(labels = comma, expand = expansion(mult = c(0, 0.14))) +
+  coord_cartesian(clip = "off") +
+  labs(
+    title = "Top Categories by Delivered Units",
+    subtitle = "Best view of demand volume and customer traffic",
+    x = "Delivered units"
+  ) +
+  theme_exec()
+```
+
+**Interpretation:** These categories are the strongest observed demand pools. They are the natural candidates for seller coverage, stock availability monitoring, and promotion planning.
+
+### Top Categories By Revenue
+
+```{r top-categories-revenue}
+category_perf %>%
+  slice_max(revenue, n = 12) %>%
+  mutate(category_label = fct_reorder(category_label, revenue)) %>%
+  ggplot(aes(x = revenue, y = category_label)) +
+  geom_col(fill = "#315c8c", width = 0.72) +
+  geom_text(aes(label = label_dollar(prefix = "R$ ", accuracy = 1)(revenue)), hjust = -0.08, size = 3.1) +
+  scale_x_continuous(labels = label_dollar(prefix = "R$ "), expand = expansion(mult = c(0, 0.18))) +
+  coord_cartesian(clip = "off") +
+  labs(
+    title = "Top Categories by Item Revenue",
+    subtitle = "Best view of commercial value, not just transaction volume",
+    x = "Delivered item revenue"
+  ) +
+  theme_exec()
+```
+
+**Interpretation:** Revenue leaders should not automatically receive all investment, but they deserve deeper review for margins, freight cost, seller reliability, and repeatability.
+
+### Top Individual Products
+
+```{r top-products}
+product_perf %>%
+  slice_max(units_sold, n = 10) %>%
+  mutate(product_label = fct_reorder(product_label, units_sold)) %>%
+  ggplot(aes(x = units_sold, y = product_label)) +
+  geom_col(fill = "#6d5f8d", width = 0.72) +
+  geom_text(aes(label = comma(units_sold)), hjust = -0.12, size = 3.1) +
+  scale_x_continuous(labels = comma, expand = expansion(mult = c(0, 0.14))) +
+  coord_cartesian(clip = "off") +
+  labs(
+    title = "Top Products by Delivered Units",
+    subtitle = "Category label + short product ID, because product names are unavailable",
+    x = "Delivered units"
+  ) +
+  theme_exec()
+```
+
+**Interpretation:** Winning SKUs can be used as benchmarks for pricing, product content, seller quality, and promotional mechanics.
+
+## What Is Not Selling?
+
+### Bottom Categories: The Tail
+
+```{r bottom-categories-table}
+bottom_categories %>%
+  transmute(
+    Category = category_label,
+    Orders = comma(orders),
+    Revenue = label_dollar(prefix = "R$ ", accuracy = 1)(revenue),
+    `Order Share` = percent(order_share, accuracy = 0.01),
+    `Revenue Share` = percent(revenue_share, accuracy = 0.01)
+  ) %>%
+  kable(align = "lrrrr")
+```
+
+```{r bottom-categories-plot}
+bottom_categories %>%
+  mutate(category_label = fct_reorder(category_label, revenue)) %>%
+  ggplot(aes(x = revenue, y = category_label)) +
+  geom_col(fill = "#a65345", width = 0.72) +
+  geom_text(aes(label = percent(revenue_share, accuracy = 0.01)), hjust = -0.12, size = 3.1) +
+  scale_x_continuous(labels = label_dollar(prefix = "R$ "), expand = expansion(mult = c(0, 0.20))) +
+  coord_cartesian(clip = "off") +
+  labs(
+    title = "Bottom 10 Categories by Revenue",
+    subtitle = "Labels show each category's contribution to total delivered item revenue",
+    x = "Delivered item revenue"
+  ) +
+  theme_exec()
+```
+
+**Interpretation:** The bottom 10 categories together contribute **`r percent(tail_revenue_share, accuracy = 0.01)`** of delivered item revenue. This is evidence of weak observed performance, but not proof that customers reject these categories. Low revenue may also reflect limited availability, weak listing quality, high freight, few reviews, or short time on platform.
+
+### Products With No Delivered Sales
+
+```{r no-delivered-sales}
+no_delivered_sales_products %>%
+  count(category_label, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  transmute(
+    Category = category_label,
+    `Products Without Delivered Sales` = n
+  ) %>%
+  kable(align = "lr")
+```
+
+**Interpretation:** These are the first candidates for sales operations diagnosis. The issue may be demand, but it may also be cancelled orders, stockouts, inactive sellers, poor search visibility, or weak product pages.
+
+## Strategic Grouping: Volume vs. Value
+
+```{r strategic-map}
+category_strategy %>%
+  group_by(volume_bucket, value_bucket, strategic_bucket) %>%
+  summarise(
+    categories = n(),
+    orders = sum(orders),
+    revenue = sum(revenue),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    order_share = orders / sum(orders),
+    revenue_share = revenue / sum(revenue),
+    label = paste0(
+      strategic_bucket,
+      "\n", categories, " categories",
+      "\nRevenue: ", percent(revenue_share, accuracy = 0.1),
+      "\nOrders: ", percent(order_share, accuracy = 0.1)
+    ),
+    volume_bucket = factor(volume_bucket, levels = c("Low Volume", "High Volume")),
+    value_bucket = factor(value_bucket, levels = c("Low Value", "High Value"))
+  ) %>%
+  ggplot(aes(x = volume_bucket, y = value_bucket, fill = revenue_share)) +
+  geom_tile(color = "white", linewidth = 1.2) +
+  geom_text(aes(label = label), color = "#1f2933", size = 3.8, lineheight = 0.95) +
+  scale_fill_gradient(
+    low = "#f3efe7",
+    high = "#276b62",
+    labels = percent
+  ) +
+  labs(
+    title = "Strategic Category Matrix: Volume vs. Value",
+    subtitle = "Buckets are split by median delivered orders and median revenue per order",
+    x = NULL,
+    y = NULL,
+    fill = "Revenue share"
+  ) +
+  theme_exec(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text = element_text(face = "bold", size = 11),
+    legend.position = "right",
+    plot.margin = margin(10, 15, 10, 10)
+  )
+```
+
+```{r strategic-buckets-table}
+category_strategy %>%
+  mutate(
+    strategic_bucket = factor(
+      strategic_bucket,
+      levels = c(
+        "High Volume - High Value",
+        "High Volume - Low Value",
+        "Low Volume - High Value",
+        "Low Volume - Low Value"
+      )
+    )
+  ) %>%
+  arrange(strategic_bucket, desc(revenue)) %>%
+  group_by(strategic_bucket) %>%
+  slice_head(n = 3) %>%
+  ungroup() %>%
+  transmute(
+    Bucket = strategic_bucket,
+    Category = category_label,
+    Orders = comma(orders),
+    `Revenue / Order` = label_dollar(prefix = "R$ ", accuracy = 1)(revenue_per_order),
+    Revenue = label_dollar(prefix = "R$ ", accuracy = 1)(revenue)
+  ) %>%
+  kable(align = "llrrr")
+```
+
+This table now shows the **top 3 revenue categories in each strategic bucket**, so all four groups are represented.
+
+**High Volume - High Value categories** are the strongest commercial candidates because they combine scale and value.
+
+**High Volume - Low Value categories** are traffic drivers. Sales can use them to grow order frequency, cross-sell, bundle accessories, and negotiate efficient fulfillment.
+
+**Low Volume - High Value categories** are revenue anchors. Sales should protect seller quality, product content, delivery reliability, and margin before pushing aggressive volume growth.
+
+**Low Volume - Low Value categories** are the clearest candidates for listing diagnosis, bundling tests, or rationalisation.
+
+## Long-Tail Risk
+
+```{r pareto}
+product_perf %>%
+  ggplot(aes(x = product_rank, y = cumulative_unit_share)) +
+  geom_line(color = "#276b62", linewidth = 1) +
+  geom_hline(yintercept = c(0.5, 0.8), linetype = "dashed", color = "gray55") +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = percent) +
+  labs(
+    title = "Product Demand Has a Long-Tail Pattern",
+    subtitle = paste0(
+      comma(products_for_80pct),
+      " products are needed to reach 80% of delivered units; ",
+      percent(one_unit_product_share, accuracy = 0.1),
+      " of sold products sold only one unit."
+    ),
+    x = "Products ranked by delivered units",
+    y = "Cumulative share of units"
+  ) +
+  theme_exec()
+```
+
+**Interpretation:** A broad catalog can improve customer choice, but the tail should be managed deliberately. Low-selling products may need better listing content, bundling, pricing tests, or retirement if they add operational complexity without strategic value.
+
+## Advanced Commercial Health Clustering
+
+The median split above is easy to explain, but it imposes fixed thresholds. The clustering analysis below uses the actual distribution of **volume**, **revenue**, and **revenue per order** to discover more data-driven strategic groups.
+
+```{r commercial-health-prep, message=FALSE, warning=FALSE}
+# Load clustering helpers.
+library(factoextra)
+
+# Prepare skewed e-commerce features with log transform and standard scaling.
+commercial_scaled <- category_perf %>%
+  select(category_label, units_sold, revenue, revenue_per_order) %>%
+  mutate(
+    across(
+      c(units_sold, revenue, revenue_per_order),
+      log1p,
+      .names = "log_{.col}"
+    )
+  ) %>%
+  select(category_label, starts_with("log_")) %>%
+  column_to_rownames("category_label") %>%
+  scale()
+```
+
+### Optimal Number of Clusters
+
+```{r commercial-health-k-evaluation, message=FALSE, warning=FALSE, fig.width=8, fig.height=4.8}
+# Elbow method for K-means: lower within-cluster variation is better.
+fviz_nbclust(
+  commercial_scaled,
+  kmeans,
+  method = "wss"
+) +
+  labs(
+    title = "Elbow Method for K-means",
+    subtitle = "Commercial health features: log-transformed and scaled"
+  ) +
+  theme_exec()
+
+# Average silhouette for PAM: higher silhouette indicates cleaner separation.
+fviz_nbclust(
+  commercial_scaled,
+  cluster::pam,
+  method = "silhouette"
+) +
+  labs(
+    title = "Average Silhouette Method for PAM",
+    subtitle = "Commercial health features: log-transformed and scaled"
+  ) +
+  theme_exec()
+```
+
+### K-means vs. PAM Clustering
+
+```{r commercial-health-clustering, message=FALSE, warning=FALSE}
+# Run both clustering methods with k = 3 for a simple executive segmentation.
+set.seed(42)
+
+kmeans_fit <- kmeans(
+  commercial_scaled,
+  centers = 3,
+  nstart = 25
+)
+
+pam_fit <- cluster::pam(
+  commercial_scaled,
+  k = 3
+)
+
+# Append cluster labels back to the original category-level performance table.
+category_perf_clustered <- category_perf %>%
+  mutate(
+    KMeans_Cluster = factor(kmeans_fit$cluster),
+    PAM_Cluster = factor(pam_fit$clustering)
+  )
+```
+
+```{r commercial-health-kmeans-plot, message=FALSE, warning=FALSE, fig.width=8, fig.height=6}
+# Visualize K-means clusters in PCA space.
+fviz_cluster(
+  kmeans_fit,
+  data = commercial_scaled,
+  repel = TRUE,
+  labelsize = 3,
+  palette = c("#276b62", "#315c8c", "#a65345")
+) +
+  labs(
+    title = "K-means Clusters: Commercial Health",
+    subtitle = "PCA projection of category-level volume, revenue, and revenue per order"
+  ) +
+  theme_exec()
+```
+
+```{r commercial-health-pam-plot, message=FALSE, warning=FALSE, fig.width=8, fig.height=6}
+# Visualize PAM clusters in PCA space.
+fviz_cluster(
+  pam_fit,
+  data = commercial_scaled,
+  repel = TRUE,
+  labelsize = 3,
+  palette = c("#276b62", "#315c8c", "#a65345")
+) +
+  labs(
+    title = "PAM Clusters: Commercial Health",
+    subtitle = "PAM is robust because each group is represented by a real category medoid"
+  ) +
+  theme_exec()
+```
+
+### PAM Cluster Profile
+
+```{r commercial-health-profile, message=FALSE, warning=FALSE}
+# Profile PAM clusters because medoid-based groups are easier to interpret.
+pam_cluster_profile <- category_perf_clustered %>%
+  group_by(PAM_Cluster) %>%
+  summarise(
+    `Total Categories` = n(),
+    `Avg Units Sold` = mean(units_sold, na.rm = TRUE),
+    `Avg Revenue` = mean(revenue, na.rm = TRUE),
+    `Avg Revenue / Order` = mean(revenue_per_order, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    `Avg Units Sold` = comma(round(`Avg Units Sold`, 0)),
+    `Avg Revenue` = label_dollar(prefix = "R$ ", accuracy = 1)(`Avg Revenue`),
+    `Avg Revenue / Order` = label_dollar(prefix = "R$ ", accuracy = 1)(`Avg Revenue / Order`)
+  )
+
+pam_cluster_profile %>%
+  kable(align = "lrrrr")
+```
+
+**Interpretation:** PAM is useful for business discussion because each cluster is anchored around real category medoids rather than abstract centroids. The profile table should be read as a data-driven segmentation of commercial health, not as a final decision rule: categories in lower-performing clusters should still be reviewed for price, stock, listing quality, seller reliability, and freight cost before action is taken.
+
+## Predictive Model: Anticipating Product Strategic Group
+
+This section builds a Random Forest classifier to predict the **PAM commercial-health cluster** of a product from its physical characteristics and pricing. The business use case is early screening: when a new product enters the platform, Sales can estimate which strategic group it most resembles.
+
+```{r random-forest-product-cluster, message=FALSE, warning=FALSE, fig.width=8, fig.height=5}
+# Load modelling packages.
+library(ranger)
+
+# Use the PAM cluster output from the previous section as category-level labels.
+category_clustered <- category_perf_clustered %>%
+  select(category_label, PAM_Cluster) %>%
+  distinct()
+
+# Build product-level modelling data from product attributes, observed prices, and category clusters.
+product_model_data <- order_items %>%
+  group_by(product_id) %>%
+  summarise(
+    price = mean(price, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    products %>%
+      transmute(
+        product_id,
+        product_category_name,
+        product_weight_g,
+        product_description_length = product_description_lenght,
+        product_photos_qty,
+        product_name_length = product_name_lenght
+      ),
+    by = "product_id"
+  ) %>%
+  left_join(category_translation, by = "product_category_name") %>%
+  mutate(
+    category_label = str_to_title(str_replace_all(
+      coalesce(product_category_name_english, product_category_name, "unknown"),
+      "_",
+      " "
+    ))
+  ) %>%
+  left_join(category_clustered, by = "category_label") %>%
+  select(
+    product_id,
+    PAM_Cluster,
+    price,
+    product_weight_g,
+    product_description_length,
+    product_photos_qty,
+    product_name_length
+  ) %>%
+  drop_na(
+    PAM_Cluster,
+    price,
+    product_weight_g,
+    product_description_length,
+    product_photos_qty,
+    product_name_length
+  ) %>%
+  mutate(
+    PAM_Cluster = factor(PAM_Cluster),
+    row_id = row_number()
+  )
+
+# Split product-level observations into 70% training and 30% testing.
+set.seed(42)
+
+train_index <- product_model_data %>%
+  group_by(PAM_Cluster) %>%
+  group_modify(~ {
+    tibble(row_id = sample(
+      .x$row_id,
+      size = floor(0.70 * nrow(.x))
+    ))
+  }) %>%
+  ungroup() %>%
+  pull(row_id)
+
+product_train <- product_model_data %>%
+  filter(row_id %in% train_index) %>%
+  select(-row_id)
+
+product_test <- product_model_data %>%
+  filter(!row_id %in% train_index) %>%
+  select(-row_id)
+
+# Train a Random Forest classifier with permutation-based importance.
+rf_model <- ranger(
+  PAM_Cluster ~ price +
+    product_weight_g +
+    product_description_length +
+    product_photos_qty +
+    product_name_length,
+  data = product_train,
+  classification = TRUE,
+  importance = "permutation",
+  probability = FALSE,
+  seed = 42
+)
+
+# Predict PAM cluster on the holdout test set.
+rf_predictions <- predict(
+  rf_model,
+  data = product_test
+)$predictions
+
+# Evaluate model performance with a confusion matrix and simple cluster metrics.
+rf_confusion_matrix <- table(
+  Predicted = factor(rf_predictions, levels = levels(product_test$PAM_Cluster)),
+  Actual = product_test$PAM_Cluster
+)
+
+rf_accuracy <- sum(diag(rf_confusion_matrix)) / sum(rf_confusion_matrix)
+
+rf_class_metrics <- tibble(
+  Cluster = levels(product_test$PAM_Cluster),
+  Precision = diag(rf_confusion_matrix) / rowSums(rf_confusion_matrix),
+  Recall = diag(rf_confusion_matrix) / colSums(rf_confusion_matrix)
+) %>%
+  mutate(
+    Precision = if_else(is.nan(Precision), NA_real_, Precision),
+    Recall = if_else(is.nan(Recall), NA_real_, Recall)
+  )
+
+rf_confusion_matrix
+
+rf_class_metrics %>%
+  mutate(
+    Precision = percent(Precision, accuracy = 0.1),
+    Recall = percent(Recall, accuracy = 0.1)
+  ) %>%
+  kable(align = "lrr", caption = paste0("Overall accuracy: ", percent(rf_accuracy, accuracy = 0.1)))
+
+# Extract and visualize feature importance from the trained Random Forest.
+rf_importance <- enframe(
+  rf_model$variable.importance,
+  name = "feature",
+  value = "importance"
+) %>%
+  mutate(
+    feature = recode(
+      feature,
+      price = "Price",
+      product_weight_g = "Product weight",
+      product_description_length = "Description length",
+      product_photos_qty = "Photo quantity",
+      product_name_length = "Name length"
+    ),
+    feature = fct_reorder(feature, importance)
+  )
+
+rf_importance %>%
+  ggplot(aes(x = importance, y = feature)) +
+  geom_col(fill = "#315c8c", width = 0.72) +
+  geom_text(aes(label = round(importance, 3)), hjust = -0.12, size = 3.2) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.18))) +
+  coord_cartesian(clip = "off") +
+  labs(
+    title = "Random Forest Feature Importance",
+    subtitle = "Which product attributes best predict the PAM commercial-health cluster?",
+    x = "Permutation importance",
+    y = NULL
+  ) +
+  theme_exec()
+```
+
+**Interpretation:** This model should be treated as a screening tool, not a final sales decision engine. If accuracy is acceptable, the feature-importance chart helps Sales understand whether early product signals such as price, weight, description length, or photo count are useful proxies for strategic potential. If accuracy is weak, it suggests that product attributes alone are not enough and should be complemented with seller quality, stock availability, reviews, delivery performance, and marketing exposure.
+
+## Business Recommendations
+
+- **Defend the winners:** keep top-volume and top-revenue categories in stock, maintain strong seller coverage, and monitor delivery promises so proven demand is not lost to operational issues.
+- **Bundle traffic drivers:** use High Volume - Low Value categories for bundles, add-ons, and cross-sell campaigns to lift basket value without depending only on discounts.
+- **Protect revenue anchors:** for Low Volume - High Value categories, focus on seller reliability, content quality, freight economics, and margin before scaling promotions.
+- **Diagnose the tail:** review bottom categories and no-delivered-sale products for price, freight, stock history, images, descriptions, reviews, and search visibility before discontinuing them.
+- **Rationalise dead stock carefully:** products with no delivered sales should be grouped into improve, promote, bundle, or retire decisions based on operational evidence, not sales volume alone.
